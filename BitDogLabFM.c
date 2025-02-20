@@ -4,6 +4,7 @@
 * - Saída FM: GPIO 15 (PWM)
 * - Ajuste de Frequência: Botão UP (GPIO 5) e DOWN (GPIO 6)
 * - Faixa FM: 88.0 a 108.0 MHz
+* Melhorias implementadas para estabilidade e performance
 */
 
 #include <stdio.h>
@@ -11,119 +12,169 @@
 #include "hardware/adc.h"
 #include "hardware/pwm.h"
 #include "hardware/timer.h"
+#include "pico/sync.h"
 
 // Definindo os pinos
-#define AUDIO_INPUT_PIN 28  // Microfone (ADC2)
-#define FM_OUTPUT_PIN 19   // Saída FM com PWM
-#define BTN_UP 5           // Botão para aumentar frequência
-#define BTN_DOWN 6         // Botão para diminuir frequência
+#define AUDIO_INPUT_PIN 28    // Microfone (ADC2)
+#define FM_OUTPUT_PIN 19      // Saída FM com PWM
+#define BTN_UP 5             // Botão para aumentar frequência
+#define BTN_DOWN 6           // Botão para diminuir frequência
 
 // Configuração da Frequência FM
-float fm_freq = 90.0;      // Frequência inicial em MHz
+volatile float fm_freq = 90.0;  // Frequência inicial em MHz
 const float freq_min = 88.0;
 const float freq_max = 108.0;
-const float freq_step = 0.1; // Incremento de 0.1 MHz
+const float freq_step = 0.1;    // Incremento de 0.1 MHz
 
-// Parâmetros do ADC
-const uint8_t avg_samples = 10;   // Média móvel com 10 amostras
-const uint amostras_por_segundo = 8000; // Frequência de amostragem
+// Parâmetros do ADC e PWM
+const uint8_t avg_samples = 16;   // Aumentado para melhor suavização
+const uint amostras_por_segundo = 44100; // Aumentado para melhor qualidade
+const uint16_t pwm_wrap_base = 255;  // Valor base para o wrap do PWM
 
-// Variável para controle do divisor de clock
-float clkdiv_base = 4.0f;
+// Buffer circular para média móvel
+uint16_t audio_buffer[16];
+uint8_t buffer_index = 0;
+
+// Mutex para proteção do acesso à frequência
+mutex_t freq_mutex;
 
 // Configuração do PWM para FM
 void setup_pwm() {
     gpio_set_function(FM_OUTPUT_PIN, GPIO_FUNC_PWM);
     uint slice = pwm_gpio_to_slice_num(FM_OUTPUT_PIN);
-
+    
+    // Calcula o clock div para a frequência inicial
+    float clkdiv = 1.0f + ((108.0 - fm_freq) / 20.0f);
+    
     pwm_config config = pwm_get_default_config();
-    pwm_config_set_clkdiv(&config, clkdiv_base);
-    pwm_config_set_wrap(&config, 255);  // Resolução de 8 bits
+    pwm_config_set_clkdiv(&config, clkdiv);
+    pwm_config_set_wrap(&config, pwm_wrap_base);
+    pwm_config_set_phase_correct(&config, true); // Reduz distorção
     pwm_init(slice, &config, true);
 }
 
-// Configuração do ADC para o microfone
+// Configuração otimizada do ADC
 void setup_adc() {
     adc_init();
-    adc_gpio_init(AUDIO_INPUT_PIN);  // Configura GPIO28 como entrada ADC
-    adc_select_input(2);             // Seleciona o canal 2 (GPIO28)
+    adc_gpio_init(AUDIO_INPUT_PIN);
+    adc_select_input(2);
+    
+    // Configura taxa de amostragem mais alta
+    adc_set_clkdiv(500000.0f / amostras_por_segundo);
+    
+    // Inicializa buffer circular
+    for (int i = 0; i < avg_samples; i++) {
+        audio_buffer[i] = 0;
+    }
 }
 
-// Configuração dos Botões com Pull-up Interno
+// Configuração dos Botões com Debounce por Hardware
 void setup_botoes() {
+    // Configura GPIO com pull-up
     gpio_init(BTN_UP);
     gpio_set_dir(BTN_UP, GPIO_IN);
-    gpio_pull_up(BTN_UP);   // Ativa o pull-up interno
-
+    gpio_pull_up(BTN_UP);
+    
     gpio_init(BTN_DOWN);
     gpio_set_dir(BTN_DOWN, GPIO_IN);
-    gpio_pull_up(BTN_DOWN); // Ativa o pull-up interno
+    gpio_pull_up(BTN_DOWN);
+    
+    // Habilita debounce por hardware
+    gpio_set_input_hysteresis_enabled(BTN_UP, true);
+    gpio_set_input_hysteresis_enabled(BTN_DOWN, true);
 }
 
-// Função para ajustar a frequência base com os botões
+// Função de ajuste de frequência com proteção de mutex
 void ajustar_frequencia() {
-    static uint32_t last_time = 0;
-    if (to_ms_since_boot(get_absolute_time()) - last_time < 200) return; // Debounce de 200ms
-
-    if (!gpio_get(BTN_UP)) { // Botão UP pressionado
-        fm_freq += freq_step;
-        last_time = to_ms_since_boot(get_absolute_time());
+    static absolute_time_t last_time = {0};
+    absolute_time_t current_time = get_absolute_time();
+    
+    // Debounce por software (200ms)
+    if (absolute_time_diff_us(last_time, current_time) < 200000) return;
+    
+    float nova_freq = fm_freq;
+    bool mudou = false;
+    
+    if (!gpio_get(BTN_UP)) {
+        nova_freq += freq_step;
+        mudou = true;
     }
-    if (!gpio_get(BTN_DOWN)) { // Botão DOWN pressionado
-        fm_freq -= freq_step;
-        last_time = to_ms_since_boot(get_absolute_time());
+    if (!gpio_get(BTN_DOWN)) {
+        nova_freq -= freq_step;
+        mudou = true;
     }
-
-    // Limita a frequência dentro da faixa FM permitida
-    if (fm_freq < freq_min) fm_freq = freq_min;
-    if (fm_freq > freq_max) fm_freq = freq_max;
-
-    // Ajusta o divisor de clock conforme a frequência desejada
-    clkdiv_base = 1.0f + ((108.0 - fm_freq) / 20.0f);
-    pwm_set_clkdiv(pwm_gpio_to_slice_num(FM_OUTPUT_PIN), clkdiv_base);
+    
+    if (mudou) {
+        // Limita a frequência
+        if (nova_freq < freq_min) nova_freq = freq_min;
+        if (nova_freq > freq_max) nova_freq = freq_max;
+        
+        mutex_enter_blocking(&freq_mutex);
+        fm_freq = nova_freq;
+        
+        // Atualiza divisor de clock do PWM
+        float clkdiv = 1.0f + ((108.0 - fm_freq) / 20.0f);
+        pwm_set_clkdiv(pwm_gpio_to_slice_num(FM_OUTPUT_PIN), clkdiv);
+        mutex_exit(&freq_mutex);
+        
+        last_time = current_time;
+    }
 }
 
-// Função de modulação da frequência conforme o áudio
-void modulate_frequency(uint slice_num, int audio_sample) {
-    // Ajuste fino do wrap conforme o áudio
-    uint16_t wrap_value = 250 + (audio_sample / 4);
+// Função otimizada de modulação de frequência
+void modulate_frequency(uint slice_num, uint16_t audio_sample) {
+    // Aplica filtro passa-baixa simples
+    static uint16_t last_sample = 0;
+    audio_sample = (audio_sample + last_sample) >> 1;
+    last_sample = audio_sample;
+    
+    // Calcula novo wrap value com range limitado
+    uint16_t wrap_value = pwm_wrap_base + (audio_sample >> 4);
+    if (wrap_value > pwm_wrap_base + 32) wrap_value = pwm_wrap_base + 32;
+    if (wrap_value < pwm_wrap_base - 32) wrap_value = pwm_wrap_base - 32;
+    
     pwm_set_wrap(slice_num, wrap_value);
+    pwm_set_chan_level(slice_num, PWM_CHAN_A, wrap_value >> 1);
 }
 
-// Loop principal da transmissão FM
+// Loop principal otimizado
 void loop_fm() {
     uint slice_num = pwm_gpio_to_slice_num(FM_OUTPUT_PIN);
-    uint16_t audio_avg = 0;
-
-    // Define o intervalo entre amostras (em microsegundos)
-    uint64_t intervalo_us = 1000000 / amostras_por_segundo;
-
+    uint64_t next_sample_time = time_us_64();
+    const uint64_t sample_interval = 1000000 / amostras_por_segundo;
+    
     while (1) {
-        // Leitura do ADC com média móvel
-        audio_avg = 0;
+        // Leitura do ADC com média móvel otimizada
+        audio_buffer[buffer_index] = adc_read();
+        buffer_index = (buffer_index + 1) & (avg_samples - 1);
+        
+        uint32_t sum = 0;
         for (int i = 0; i < avg_samples; i++) {
-            audio_avg += adc_read();
-            sleep_us(125); // Ajuste fino para suavizar o áudio
+            sum += audio_buffer[i];
         }
-        audio_avg /= avg_samples;
-
-        // Normaliza para 8 bits (0 a 255)
-        int audio_sample = audio_avg >> 4;
-
-        // Modula a frequência conforme o valor do áudio
-        modulate_frequency(slice_num, audio_sample);
-
-        // Ajusta a frequência base conforme os botões
+        uint16_t audio_avg = sum / avg_samples;
+        
+        // Modula a frequência
+        modulate_frequency(slice_num, audio_avg);
+        
+        // Verifica botões
         ajustar_frequencia();
-
-        sleep_us(intervalo_us); // Controla a taxa de amostragem
+        
+        // Timing preciso
+        next_sample_time += sample_interval;
+        busy_wait_until(next_sample_time);
     }
 }
 
 int main() {
     stdio_init_all();
+    mutex_init(&freq_mutex);
+    
     setup_pwm();
     setup_adc();
     setup_botoes();
+    
+    printf("Transmissor FM iniciado na frequência %.1f MHz\n", fm_freq);
+    
     loop_fm();
 }
